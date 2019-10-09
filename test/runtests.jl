@@ -67,9 +67,9 @@ end
         """
         let sortdir = :ascending, sortcol = (id=1, _type=:numeric)
             @expandsto """
-              <div class='numeric sort ascending'>Contents</div>
-              <div class='numeric'>Contents</div>
-              <div>Contents</div>
+            <div class='numeric sort ascending'>Contents</div>
+            <div class='numeric'>Contents</div>
+            <div>Contents</div>
             """ haml"""
             - for item in [ (id=1, _type=:numeric), (id=2, _type=:numeric), (id=3, _type=nothing) ]
               %div(class = [item._type; item == sortcol && [:sort, sortdir]]) Contents
@@ -123,25 +123,36 @@ end
             %p.beans(food = "true") The magical fruit
             %h1.class.otherclass#id La La La
         """
+
+        @expandsto """
+        <blockquote><div>
+          Foo!
+        </div></blockquote>
+        """ haml"""
+        %blockquote<
+          %div
+            Foo!
+        """
     end
     @testset "Whitespace" begin
         @expandsto "" haml""
-        @expandsto "
-        " haml"
-        "
-        @expandsto "
-
-        " haml"
-
-        "
+        # disabled while we re-work indentation handling
+        #@expandsto "
+        #" haml"
+        #"
+        #@expandsto "
+#
+        #" haml"
+#
+        #"
         # no closing newline
         @expandsto "<div class='hello'></div>" haml"%div.hello"
 
         # a comment after the comma
         @expandsto """
         <span a='b' c='d'>Hello everyone!</span>
-          <div>1</div>
-          <div>2</div>
+        <div>1</div>
+        <div>2</div>
         """ haml"""
         %span(a="b", # set a to b
               c="d") Hello everyone!
@@ -216,6 +227,36 @@ end
         %p bar
         """
     end
+    @testset "Helper methods" begin
+        @expandsto """
+        (<a href='#'>learn more</a>)
+        """ haml"""
+        - @surround("(", ")") do
+          %a(href="#") learn more
+        """
+        @expandsto """
+        *<span>Required</span>
+        """ haml"""
+        - @precede("*") do
+          %span Required
+        """
+        @expandsto """
+        Begin by
+        <a href='#'>filling out your profile</a>,
+        <a href='#'>adding a bio</a>,
+        and
+        <a href='#'>inviting friends</a>.
+        """ haml"""
+        Begin by
+        - @succeed(",") do
+          %a(href="#") filling out your profile
+        - @succeed(",") do
+          %a(href="#") adding a bio
+        and
+        - @succeed(".") do
+          %a(href="#") inviting friends
+        """
+    end
     @testset "Scoping" begin
         let a = 2
             haml"""
@@ -261,13 +302,13 @@ end
         Bye!
         """ haml"""
         Hi!
-        - write(@io, "Hello!\n")
-        - write(@HAML.io, "Bye!\n")
+        - @output "Hello!\n"
+        - @HAML.output "Bye!\n"
         """
         @expandsto """
-        Writing to @io
+        Using the @output macro
         """ haml"""
-        :include("hamljl/at-io.hamljl")
+        - @include("hamljl/at-output.hamljl")
         """
         # pending https://github.com/JuliaLang/julia/issues/32121#issuecomment-534982081
         #let attribute = :href # hygiene of the => operator inside a named tuple
@@ -280,27 +321,27 @@ end
     end
     @testset "Control flow" begin
         @expandsto """
-          <div>1</div>
-          <div>2</div>
-          <div>3</div>
+        <div>1</div>
+        <div>2</div>
+        <div>3</div>
         """ haml"""
         - for i in 1:3
           %= i
         """
 
         @expandsto """
-          <div>1</div>
-          <div>2</div>
-          <div>3</div>
+        <div>1</div>
+        <div>2</div>
+        <div>3</div>
         """ haml"""
         - map(1:3) do i
           %= i
         """
 
         @expandsto """
-          <div>3</div>
-          <div>2</div>
-          <div>1</div>
+        <div>3</div>
+        <div>2</div>
+        <div>1</div>
         """ haml"""
         - list = collect(1:3)
         - while !isempty(list)
@@ -308,7 +349,7 @@ end
         """
 
         @expandsto """
-          <p>All else follows</p>
+        <p>All else follows</p>
         """ haml"""
         - if 2 + 2 == 4
           %p All else follows
@@ -332,7 +373,7 @@ end
           </body>
         </html>
         """ haml"""
-        :include("hamljl/hitchhiker.hamljl", question = "What's the answer to life, the universe, and everything?", answer = 42)
+        - @include("hamljl/hitchhiker.hamljl", question = "What's the answer to life, the universe, and everything?", answer = 42)
         """
 
         @expandsto """
@@ -342,7 +383,7 @@ end
           <p>Did you see the little button?</p>
         </form>
         """ haml"""
-        :include("hamljl/form.hamljl")
+        - @include("hamljl/form.hamljl")
         """
 
         let io = IOBuffer()  # test the render(...) entrypoint
