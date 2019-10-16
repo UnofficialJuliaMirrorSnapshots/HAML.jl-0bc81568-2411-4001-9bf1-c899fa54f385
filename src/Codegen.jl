@@ -5,8 +5,8 @@ import Base.Meta: parse, quot
 import DataStructures: OrderedDict
 import Markdown: htmlesc
 
-import ..Hygiene: replace_macro_hygienic, deref
-import ..Parse: @capture, @mustcapture, Source
+import ..Hygiene: expand_macros_hygienic, replace_expression_nodes_unescaped, hasnode
+import ..Parse: @capture, @mustcapture, Source, parse_contentline
 
 include("Attributes.jl")
 import .Attributes: mergeattributes, writeattributes
@@ -36,7 +36,7 @@ indentlength(::Nothing) = -1
 function materialize_indentation(expr, cur="")
     if expr isa Expr && expr.head == :hamlindented
         return materialize_indentation(expr.args[2], cur * expr.args[1])
-    elseif expr isa Indentation
+    elseif expr isa Expr && expr.head == :hamlindentation
         return cur
     elseif expr isa Expr
         args = map(a -> materialize_indentation(a, cur), expr.args)
@@ -46,32 +46,15 @@ function materialize_indentation(expr, cur="")
     end
 end
 
-extendoutput!(output) = output
-
-function extendoutput!(output, x, xs...)
-    if !isempty(output) && output[end] isa AbstractString && x isa AbstractString
-        output[end] *= x
-    else
-        push!(output, x)
-    end
-    extendoutput!(output, xs...)
-end
-
 function extendblock!(block, expr)
     @assert block isa Expr && block.head == :block
     if expr isa Expr && expr.head == :block
         for e in expr.args
             extendblock!(block, e)
         end
-        return
-    elseif expr isa Expr && expr.head == :macrocall && expr.args[1] == Symbol("@output")
-        prev = block.args[end]
-        if prev isa Expr && prev.head == :macrocall && prev.args[1] == Symbol("@output")
-            extendoutput!(prev.args, expr.args[3:end]...)
-            return
-        end
+    else
+        push!(block.args, expr)
     end
-    push!(block.args, expr)
 end
 
 function parse_tag_stanza!(code, curindent, source)
@@ -115,12 +98,7 @@ function parse_tag_stanza!(code, curindent, source)
             (?<equalssign>\=)
             |
             (?<closingslash>/)?
-            (?:
-              \h+
-              (?<rest_of_line>.+)
-            )?
-            $
-            (?<newline>\v*)
+            (?:\h*)
         )
     """mx
 
@@ -137,10 +115,8 @@ function parse_tag_stanza!(code, curindent, source)
         code_for_inline_val = @nolinenodes quote
             @htmlesc string($(esc(expr)))
         end
-    elseif !isnothing(rest_of_line)
-        code_for_inline_val = @nolinenodes quote
-            @output $rest_of_line
-        end
+    else
+        code_for_inline_val, newline = parse_contentline(source)
     end
 
     body = @nolinenodes quote end
@@ -150,7 +126,13 @@ function parse_tag_stanza!(code, curindent, source)
     else
         if isnothing(eatwhitespace)
             indentation, newline = parseresult
-            body = filterlinenodes(:( @indented($indentation, (@nextline; $body)); @nextline ))
+            body = Expr(
+                :block,
+                Expr(:hamlindented, indentation,
+                    filterlinenodes(:(@nextline; $body))
+                ),
+                :(@nextline),
+            )
         end
         haveblock = true
     end
@@ -224,7 +206,6 @@ function parse_indented_block!(code, curindent, source)
                 isnothing(curindent) || firstindent == indent || error(source, "Jagged indentation")
                 extendblock!(code, :( @output $newline @indentation ))
             end
-            push!(code.args, LineNumberNode(source))
 
             if sigil in ("%", "#", ".")
                 newline = parse_tag_stanza!(code, indent, source)
@@ -242,7 +223,7 @@ function parse_indented_block!(code, curindent, source)
                     )$\v?
                 """mx
                 if startswith(code_to_parse, r"\h*(?:for|while)\b")
-                    block = parse(source, "$code_to_parse\nend", code_to_parse)
+                    block = parse(source, "$code_to_parse\nend", code_to_parse, with_linenode=false)
                     block.args[1] = esc(block.args[1])
                     body_of_loop = block.args[2] = @nolinenodes quote
                         !first && @nextline
@@ -252,6 +233,7 @@ function parse_indented_block!(code, curindent, source)
                     if !isnothing(parseresult)
                         _, newline = parseresult
                     end
+                    push!(code.args, LineNumberNode(source))
                     extendblock!(code, @nolinenodes quote
                         let first=true
                             $block
@@ -259,15 +241,16 @@ function parse_indented_block!(code, curindent, source)
                     end)
                     controlflow_this = block
                 elseif startswith(code_to_parse, r"\h*if\b")
-                    block = parse(source, "$code_to_parse\nend", code_to_parse)
+                    block = parse(source, "$code_to_parse\nend", code_to_parse, with_linenode=false)
                     block.args[1] = esc(block.args[1])
+                    push!(code.args, LineNumberNode(source))
                     extendblock!(code, block)
                     parseresult = parse_indented_block!(block.args[2], indent, source)
                     if !isnothing(parseresult)
                         _, newline = parseresult
                     end
                     controlflow_this = block
-                elseif (block = parse(source, "$code_to_parse\nend", code_to_parse, raise=false); block isa Expr && block.head == :do)
+                elseif (block = parse(source, "$code_to_parse\nend", code_to_parse, raise=false, with_linenode=false); block isa Expr && block.head == :do)
                     block.args[1] = esc(block.args[1])
                     block.args[2].args[1] = esc(block.args[2].args[1])
                     body_of_fun = block.args[2].args[2] = @nolinenodes quote
@@ -278,13 +261,15 @@ function parse_indented_block!(code, curindent, source)
                     if !isnothing(parseresult)
                         _, newline = parseresult
                     end
+                    push!(code.args, LineNumberNode(source))
                     extendblock!(code, @nolinenodes quote
                         let first=true
                             $block
                         end
                     end)
                 else
-                    expr = parse(source, code_to_parse)
+                    expr = parse(source, code_to_parse, with_linenode=false)
+                    push!(code.args, LineNumberNode(source))
                     extendblock!(code, esc(expr))
                     newline = ""
                 end
@@ -298,29 +283,29 @@ function parse_indented_block!(code, curindent, source)
                 """mx
                 expr = parse(source, code_to_parse)
                 extendblock!(code, @nolinenodes quote
-                    let val = $(esc(expr))
-                        @htmlesc string(val)
-                    end
+                    @htmlesc string($(esc(expr)))
                 end)
             elseif sigil == "\\" || sigil == nothing
-                @mustcapture source "Expecting literal data" r"\h*(?<rest_of_line>.*)$(?<newline>\v?)"m
-                extendblock!(code, @nolinenodes quote
-                    @output $"$rest_of_line"
-                end)
+                @mustcapture source "Expecting space" r"\h*"
+                linecode, newline = parse_contentline(source)
+                extendblock!(code, linecode)
             elseif sigil == "/"
-                @mustcapture source "Expecting a comment" r"\h*(?<rest_of_line>.*)$(?<newline>\v?)"m
-                if !isempty(rest_of_line)
+                @mustcapture source "Expecting space" r"\h*"
+                linecode, newline = parse_contentline(source)
+                if !isnothing(linecode)
                     extendblock!(code, @nolinenodes quote
-                        @output $"<!-- $rest_of_line -->"
+                        @output "<!-- "
+                        $linecode
+                        @output " -->"
                     end)
                 else
                     body = @nolinenodes quote end
                     parseresult = parse_indented_block!(body, indent, source)
                     if !isnothing(parseresult)
                         indentation, newline = parseresult
-                        body = filterlinenodes(:( @indented $indentation (@indent; $body) ))
+                        body = filterlinenodes(:( @indented $indentation (@nextline; $body) ))
                         extendblock!(code, @nolinenodes quote
-                            @output $"<!--\n"
+                            @output $"<!--"
                             $body
                             @nextline $"-->"
                         end)
@@ -340,27 +325,96 @@ function parse_indented_block!(code, curindent, source)
     end
 end
 
-function generate_haml_writer_codeblock(source)
-    code = @nolinenodes quote end
-    parseresult = parse_indented_block!(code, nothing, source)
-    if isnothing(parseresult)
-        return code
+isoutput(expr) = expr isa Expr && expr.head == :hamloutput
+
+extendoutput!(output) = output
+
+function extendoutput!(output, x, xs...)
+    if !isempty(output) && output[end] isa AbstractString && x isa AbstractString
+        output[end] *= x
     else
-        indentation, newline = parseresult
-        return @nolinenodes quote
-            @output $indentation
-            $code
-            @output $newline
+        push!(output, x)
+    end
+    extendoutput!(output, xs...)
+end
+
+function merge_outputs(expr)
+    if expr isa Expr && expr.head == :block
+        prev = nothing
+        args = []
+        for a in expr.args
+            a = merge_outputs(a)
+            if isoutput(prev) && isoutput(a)
+                extendoutput!(prev.args, a.args...)
+            elseif isoutput(a)
+                prev = Expr(:hamloutput)
+                extendoutput!(prev.args, a.args...)
+                push!(args, prev)
+            else
+                prev = deepcopy(a)
+                push!(args, prev)
+            end
         end
+        if length(args) == 1 && isoutput(args[1])
+            return args[1]
+        else
+            return Expr(:block, args...)
+        end
+    elseif expr isa Expr
+        args = map(merge_outputs, expr.args)
+        return Expr(expr.head, args...)
+    else
+        return expr
     end
 end
 
-macro haml_str(source)
-    code = generate_haml_writer_codeblock(Source(source, __source__))
-    code = replace_macro_hygienic(@__MODULE__, __module__, code, at_io => :io)
+function generate_haml_writer_codeblock(usermod, source, extraindent="")
+    code = @nolinenodes quote end
+    parseresult = parse_indented_block!(code, nothing, source)
+    if !isnothing(parseresult)
+        indentation, newline = parseresult
+        code = @nolinenodes quote
+            @output $indentation
+            $(code.args...)
+            @output $newline
+        end
+    end
+    code = expand_macros_hygienic(@__MODULE__, usermod, code)
+    code = Expr(:hamlindented, extraindent, code)
     code = materialize_indentation(code)
+    code = merge_outputs(code)
+    return code
+end
 
-    @nolinenodes quote
+function replace_output_nodes(code, io)
+    code = replace_expression_nodes_unescaped(:hamloutput, code) do (args...)
+        write_statements = map(args) do a
+            # each in its own statement; no need to put everything on the
+            # stack before starting sending stuff out on the io. (By this
+            # time, static strings have already been concatenated.)
+            :( write($io, $a) )
+        end
+        Expr(:block, write_statements...)
+    end
+    code = replace_expression_nodes_unescaped(:hamlio, code) do
+        io
+    end
+    return code
+end
+
+macro haml_str(source)
+    # FIXME: off-by-one because triple-quoted haml""" has its
+    # first character on the next line.
+    loc = LineNumberNode(__source__.line + 1, __source__.file)
+    code = generate_haml_writer_codeblock(__module__, Source(source, loc))
+
+    if isoutput(code) && !hasnode(:hamlio, code)
+        return Expr(:string, code.args...)
+    end
+
+    code = replace_output_nodes(code, :io)
+
+    return @nolinenodes quote
         io = IOBuffer()
         $code
         String(take!(io))
@@ -368,14 +422,11 @@ macro haml_str(source)
 end
 
 macro io()
-    error("The @io macro can only be used from within a HAML template")
-end
-
-mutable struct Indentation
+    Expr(:hamlio)
 end
 
 macro indentation()
-    Indentation()
+    Expr(:hamlindentation)
 end
 
 
@@ -383,24 +434,22 @@ macro indented(indentation, expr)
     Expr(:hamlindented, esc(indentation), esc(expr))
 end
 
-macro nextline(expr...)
-    expr = map(esc, expr)
-    :( @output "\n" @indentation() $(expr...) )
-end
-
 macro output(expr...)
     expr = map(esc, expr)
-    :( write(@io, $(expr...)) )
+    Expr(:hamloutput, expr...)
 end
 
 macro indent()
     :( @output @indentation )
 end
 
+macro nextline(expr...)
+    expr = map(esc, expr)
+    :( @output "\n" @indentation() $(expr...) )
+end
+
 macro htmlesc(expr...)
     :( @output $htmlesc($(expr...)) )
 end
-
-const at_io = getproperty(@__MODULE__, Symbol("@io"))
 
 end # module
